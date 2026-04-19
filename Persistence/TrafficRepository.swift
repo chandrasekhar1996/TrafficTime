@@ -1,5 +1,6 @@
 import CoreLocation
 import Foundation
+import os
 import SQLite3
 
 struct TrafficEventPoint: Codable {
@@ -52,22 +53,45 @@ struct AnalyticsSnapshot {
 
 final class TrafficRepository: ObservableObject {
     @Published private(set) var events: [TrafficEvent] = []
+    @Published private(set) var lastPersistenceError: String?
 
-    private let store: SQLiteTrafficStore
+    private let store: TrafficStore
+    private let logger = Logger(subsystem: "TrafficTime", category: "Persistence")
 
-    init() {
-        self.store = SQLiteTrafficStore()
-        self.events = (try? store.loadAllEvents()) ?? []
+    init(store: TrafficStore = SQLiteTrafficStore()) {
+        self.store = store
+
+        do {
+            self.events = try store.loadAllEvents()
+        } catch {
+            self.events = []
+            handlePersistenceError(error, message: "Failed to load persisted traffic events.")
+        }
     }
 
     func save(event: TrafficEvent) {
         events.append(event)
-        try? store.insert(event: event)
+        do {
+            try store.insert(event: event)
+            lastPersistenceError = nil
+        } catch {
+            handlePersistenceError(error, message: "Could not persist traffic event.")
+        }
     }
 
     func clear() {
         events.removeAll()
-        try? store.clearAll()
+        do {
+            try store.clearAll()
+            lastPersistenceError = nil
+        } catch {
+            handlePersistenceError(error, message: "Could not clear persisted traffic events.")
+        }
+    }
+
+    private func handlePersistenceError(_ error: Error, message: String) {
+        lastPersistenceError = message
+        logger.error("\(message, privacy: .public) Error: \(error.localizedDescription, privacy: .public)")
     }
 
     func analyticsSnapshot(calendar: Calendar = .current) -> AnalyticsSnapshot {
@@ -176,21 +200,60 @@ final class TrafficRepository: ObservableObject {
     }
 }
 
-private final class SQLiteTrafficStore {
-    private var db: OpaquePointer?
+protocol TrafficStore {
+    func insert(event: TrafficEvent) throws
+    func loadAllEvents() throws -> [TrafficEvent]
+    func clearAll() throws
+}
 
-    init(filename: String = "traffic_events.sqlite") {
+struct SQLiteTrafficStoreTelemetry {
+    var onInsertFailure: ((Error) -> Void)?
+    var onSchemaInitializationFailure: ((Error) -> Void)?
+}
+
+private enum SQLiteStoreError: LocalizedError {
+    case openFailed(path: String, code: Int32, message: String)
+    case sqliteFailure(operation: String, code: Int32, message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .openFailed(path, code, message):
+            return "Failed to open SQLite DB at \(path) (code \(code)): \(message)"
+        case let .sqliteFailure(operation, code, message):
+            return "SQLite \(operation) failed (code \(code)): \(message)"
+        }
+    }
+}
+
+final class SQLiteTrafficStore: TrafficStore {
+    private var db: OpaquePointer?
+    private let logger = Logger(subsystem: "TrafficTime", category: "SQLiteStore")
+    private let telemetry: SQLiteTrafficStoreTelemetry
+
+    init(filename: String = "traffic_events.sqlite", telemetry: SQLiteTrafficStoreTelemetry = SQLiteTrafficStoreTelemetry()) {
+        self.telemetry = telemetry
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let dbURL = directory.appendingPathComponent(filename)
 
-        if sqlite3_open(dbURL.path, &db) != SQLITE_OK {
+        let openCode = sqlite3_open(dbURL.path, &db)
+        if openCode != SQLITE_OK {
+            let openError = SQLiteStoreError.openFailed(path: dbURL.path, code: openCode, message: currentErrorMessage())
+            logger.error("SQLite open failed: \(openError.localizedDescription, privacy: .public)")
+            telemetry.onSchemaInitializationFailure?(openError)
             db = nil
             return
         }
 
-        createSchemaIfNeeded()
+        do {
+            try createSchemaIfNeeded()
+        } catch {
+            logger.error("Schema initialization failed: \(error.localizedDescription, privacy: .public)")
+            telemetry.onSchemaInitializationFailure?(error)
+            sqlite3_close(db)
+            db = nil
+        }
     }
 
     deinit {
@@ -200,7 +263,9 @@ private final class SQLiteTrafficStore {
     }
 
     func insert(event: TrafficEvent) throws {
-        guard let db else { return }
+        guard db != nil else {
+            throw SQLiteStoreError.sqliteFailure(operation: "insert", code: SQLITE_MISUSE, message: "Database is not available")
+        }
 
         try execute(sql: "BEGIN TRANSACTION;")
 
@@ -212,8 +277,8 @@ private final class SQLiteTrafficStore {
         """
 
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, insertEventSQL, -1, &stmt, nil)
-        defer { sqlite3_finalize(stmt) }
+        try prepare(sql: insertEventSQL, statement: &stmt)
+        defer { _ = finalize(statement: stmt, operation: "finalize insert traffic_events statement") }
 
         let points = event.geometry
         let startPoint = points.first
@@ -234,15 +299,17 @@ private final class SQLiteTrafficStore {
 
         guard sqlite3_step(stmt) == SQLITE_DONE else {
             try execute(sql: "ROLLBACK;")
-            return
+            let error = sqliteError(operation: "step insert traffic_events")
+            telemetry.onInsertFailure?(error)
+            throw error
         }
 
         try execute(sql: "DELETE FROM traffic_event_points WHERE event_id = '\(event.id.uuidString)';")
 
         let insertPointSQL = "INSERT INTO traffic_event_points (event_id, seq, lat, lon) VALUES (?, ?, ?, ?);"
         var pointStmt: OpaquePointer?
-        sqlite3_prepare_v2(db, insertPointSQL, -1, &pointStmt, nil)
-        defer { sqlite3_finalize(pointStmt) }
+        try prepare(sql: insertPointSQL, statement: &pointStmt)
+        defer { _ = finalize(statement: pointStmt, operation: "finalize insert traffic_event_points statement") }
 
         for (index, point) in event.geometry.enumerated() {
             sqlite3_bind_text(pointStmt, 1, (event.id.uuidString as NSString).utf8String, -1, SQLITE_TRANSIENT)
@@ -251,10 +318,19 @@ private final class SQLiteTrafficStore {
             sqlite3_bind_double(pointStmt, 4, point.longitude)
 
             guard sqlite3_step(pointStmt) == SQLITE_DONE else {
-                sqlite3_reset(pointStmt)
-                continue
+                let resetCode = sqlite3_reset(pointStmt)
+                if resetCode != SQLITE_OK {
+                    throw sqliteError(operation: "reset failed traffic_event_points insert", code: resetCode)
+                }
+                try execute(sql: "ROLLBACK;")
+                let error = sqliteError(operation: "step insert traffic_event_points")
+                telemetry.onInsertFailure?(error)
+                throw error
             }
-            sqlite3_reset(pointStmt)
+            let resetCode = sqlite3_reset(pointStmt)
+            guard resetCode == SQLITE_OK else {
+                throw sqliteError(operation: "reset traffic_event_points insert", code: resetCode)
+            }
             sqlite3_clear_bindings(pointStmt)
         }
 
@@ -271,13 +347,17 @@ private final class SQLiteTrafficStore {
         """
 
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        defer { sqlite3_finalize(stmt) }
+        try prepare(sql: sql, statement: &stmt)
+        defer { _ = finalize(statement: stmt, operation: "finalize loadAllEvents statement") }
 
         var events: [TrafficEvent] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var stepCode = sqlite3_step(stmt)
+        while stepCode == SQLITE_ROW {
             guard let idPtr = sqlite3_column_text(stmt, 0),
-                  let id = UUID(uuidString: String(cString: idPtr)) else { continue }
+                  let id = UUID(uuidString: String(cString: idPtr)) else {
+                stepCode = sqlite3_step(stmt)
+                continue
+            }
 
             let event = TrafficEvent(
                 id: id,
@@ -293,6 +373,11 @@ private final class SQLiteTrafficStore {
                 )
             )
             events.append(event)
+            stepCode = sqlite3_step(stmt)
+        }
+
+        guard stepCode == SQLITE_DONE else {
+            throw sqliteError(operation: "step loadAllEvents", code: stepCode)
         }
 
         return events
@@ -308,21 +393,28 @@ private final class SQLiteTrafficStore {
 
         let sql = "SELECT lat, lon FROM traffic_event_points WHERE event_id = ? ORDER BY seq ASC;"
         var stmt: OpaquePointer?
-        sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        defer { sqlite3_finalize(stmt) }
+        guard (try? prepare(sql: sql, statement: &stmt)) != nil else { return [] }
+        defer { _ = finalize(statement: stmt, operation: "finalize loadPoints statement") }
 
         sqlite3_bind_text(stmt, 1, (eventID.uuidString as NSString).utf8String, -1, SQLITE_TRANSIENT)
 
         var points: [TrafficEventPoint] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var stepCode = sqlite3_step(stmt)
+        while stepCode == SQLITE_ROW {
             points.append(TrafficEventPoint(latitude: sqlite3_column_double(stmt, 0), longitude: sqlite3_column_double(stmt, 1)))
+            stepCode = sqlite3_step(stmt)
+        }
+
+        guard stepCode == SQLITE_DONE else {
+            logger.error("loadPoints step failed: \(currentErrorMessage(), privacy: .public)")
+            return []
         }
 
         return points
     }
 
-    private func createSchemaIfNeeded() {
-        try? execute(sql: """
+    private func createSchemaIfNeeded() throws {
+        try execute(sql: """
         CREATE TABLE IF NOT EXISTS traffic_events (
             id TEXT PRIMARY KEY,
             start_ts REAL NOT NULL,
@@ -339,7 +431,7 @@ private final class SQLiteTrafficStore {
         );
         """)
 
-        try? execute(sql: """
+        try execute(sql: """
         CREATE TABLE IF NOT EXISTS traffic_event_points (
             event_id TEXT NOT NULL,
             seq INTEGER NOT NULL,
@@ -350,15 +442,51 @@ private final class SQLiteTrafficStore {
         );
         """)
 
-        try? execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_start_ts ON traffic_events(start_ts);")
-        try? execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_end_ts ON traffic_events(end_ts);")
-        try? execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_start_location ON traffic_events(start_lat, start_lon);")
-        try? execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_points_location ON traffic_event_points(lat, lon);")
+        try execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_start_ts ON traffic_events(start_ts);")
+        try execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_end_ts ON traffic_events(end_ts);")
+        try execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_events_start_location ON traffic_events(start_lat, start_lon);")
+        try execute(sql: "CREATE INDEX IF NOT EXISTS idx_traffic_points_location ON traffic_event_points(lat, lon);")
     }
 
     private func execute(sql: String) throws {
-        guard let db else { return }
-        sqlite3_exec(db, sql, nil, nil, nil)
+        guard let db else {
+            throw SQLiteStoreError.sqliteFailure(operation: "exec", code: SQLITE_MISUSE, message: "Database is not available")
+        }
+
+        let code = sqlite3_exec(db, sql, nil, nil, nil)
+        guard code == SQLITE_OK else {
+            throw sqliteError(operation: "exec", code: code)
+        }
+    }
+
+    private func prepare(sql: String, statement: inout OpaquePointer?) throws {
+        guard let db else {
+            throw SQLiteStoreError.sqliteFailure(operation: "prepare", code: SQLITE_MISUSE, message: "Database is not available")
+        }
+
+        let code = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
+        guard code == SQLITE_OK else {
+            throw sqliteError(operation: "prepare", code: code)
+        }
+    }
+
+    @discardableResult
+    private func finalize(statement: OpaquePointer?, operation: String) -> Int32 {
+        let code = sqlite3_finalize(statement)
+        if code != SQLITE_OK {
+            logger.error("\(operation, privacy: .public) failed: \(currentErrorMessage(), privacy: .public)")
+        }
+        return code
+    }
+
+    private func sqliteError(operation: String, code: Int32? = nil) -> SQLiteStoreError {
+        let status = code ?? sqlite3_errcode(db)
+        return .sqliteFailure(operation: operation, code: status, message: currentErrorMessage())
+    }
+
+    private func currentErrorMessage() -> String {
+        guard let db, let cString = sqlite3_errmsg(db) else { return "Unknown SQLite error" }
+        return String(cString: cString)
     }
 }
 
