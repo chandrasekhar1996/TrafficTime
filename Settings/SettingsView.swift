@@ -6,14 +6,22 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section("Traffic Event Detection") {
-                Stepper(value: $settings.speedThresholdMph, in: 10...85, step: 1) {
-                    Text("Speed threshold: \(settings.speedThresholdMph, specifier: "%.0f") mph")
+                Picker("Speed units", selection: $settings.speedUnit) {
+                    ForEach(SpeedUnit.allCases) { unit in
+                        Text(unit.displayName).tag(unit)
+                    }
                 }
-                Stepper(value: $settings.startDurationSeconds, in: 5...120, step: 1) {
-                    Text("Start duration: \(settings.startDurationSeconds, specifier: "%.0f") s")
+
+                Stepper(value: $settings.speedThreshold, in: 10...140, step: 1) {
+                    Text("Traffic speed threshold: \(settings.speedThreshold, specifier: "%.0f") \(settings.speedUnit.displayName)")
                 }
-                Stepper(value: $settings.endDurationSeconds, in: 5...60, step: 1) {
-                    Text("End duration: \(settings.endDurationSeconds, specifier: "%.0f") s")
+
+                Stepper(value: $settings.startDurationSeconds, in: 5...180, step: 1) {
+                    Text("Continuous low-speed start duration: \(settings.startDurationSeconds, specifier: "%.0f") s")
+                }
+
+                Stepper(value: $settings.endDurationSeconds, in: 5...120, step: 1) {
+                    Text("End / hysteresis duration: \(settings.endDurationSeconds, specifier: "%.0f") s")
                 }
             }
 
@@ -24,6 +32,10 @@ struct SettingsView: View {
                         Text("Max horizontal accuracy: \(settings.minGpsAccuracyMeters, specifier: "%.0f") m")
                     }
                 }
+            }
+
+            Section("Notifications") {
+                Toggle("Notify on traffic event enter/exit", isOn: $settings.notificationsEnabled)
             }
 
             Section("Behavior") {
