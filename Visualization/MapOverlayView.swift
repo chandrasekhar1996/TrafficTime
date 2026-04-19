@@ -7,6 +7,7 @@ struct MapOverlayView: View {
     @State private var filters = MapInsightFilters()
     @State private var layers = MapInsightLayerState()
     @State private var selectedInsight: MapSelection?
+    @State private var recenterTrigger = 0
 
     private var filteredEvents: [TrafficEvent] {
         TrafficSpatialAggregation.filter(events: repository.events, filters: filters)
@@ -32,6 +33,7 @@ struct MapOverlayView: View {
             layerToggles
 
             TrafficInsightsMapView(
+                recenterTrigger: recenterTrigger,
                 segments: layers.showsSegments ? segmentInsights : [],
                 hotspots: layers.showsHotspots ? hotspotInsights : [],
                 corridors: layers.showsCorridors ? corridorInsights : [],
@@ -39,6 +41,7 @@ struct MapOverlayView: View {
             )
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
 
+            recenterRow
             summaryRow
         }
         .padding()
@@ -86,6 +89,20 @@ struct MapOverlayView: View {
         }
         .toggleStyle(.button)
         .font(.caption)
+    }
+
+
+    private var recenterRow: some View {
+        HStack {
+            Spacer()
+            Button {
+                recenterTrigger += 1
+            } label: {
+                Label("Recenter to filtered data", systemImage: "scope")
+            }
+            .buttonStyle(.bordered)
+            .font(.caption)
+        }
     }
 
     private var summaryRow: some View {
@@ -147,6 +164,7 @@ private struct InsightDetailSheet: View {
 }
 
 private struct TrafficInsightsMapView: UIViewRepresentable {
+    let recenterTrigger: Int
     let segments: [SegmentInsight]
     let hotspots: [TrafficCellAggregation]
     let corridors: [CorridorAggregation]
@@ -180,6 +198,9 @@ private struct TrafficInsightsMapView: UIViewRepresentable {
 
         private var overlayLookup: [ObjectIdentifier: MapSelection] = [:]
         private var hasSetInitialRegion = false
+        private var lastDataSignature: String?
+        private var lastRecenterTrigger: Int = 0
+        private var hasUserAdjustedCamera = false
 
         init(parent: TrafficInsightsMapView) {
             self.parent = parent
@@ -204,14 +225,26 @@ private struct TrafficInsightsMapView: UIViewRepresentable {
 
             mapView.addAnnotations(parent.hotspots.map(HotspotAnnotation.init))
 
-            if !hasSetInitialRegion {
-                zoomToFitData(on: mapView)
+            let dataSignature = makeVisibleDataSignature()
+            let shouldForceRecenter = parent.recenterTrigger != lastRecenterTrigger
+            let shouldAutoFitForDataChange = hasSetInitialRegion
+                && lastDataSignature != dataSignature
+                && !hasUserAdjustedCamera
+
+            if !hasSetInitialRegion || shouldForceRecenter || shouldAutoFitForDataChange {
+                zoomToFitData(on: mapView, animated: hasSetInitialRegion)
                 hasSetInitialRegion = true
+                hasUserAdjustedCamera = false
             }
+
+            lastDataSignature = dataSignature
+            lastRecenterTrigger = parent.recenterTrigger
         }
 
-        private func zoomToFitData(on mapView: MKMapView) {
+        private func zoomToFitData(on mapView: MKMapView, animated: Bool) {
             let allCoords = parent.segments.flatMap(\.coordinates)
+                + parent.hotspots.map(\.coordinate)
+                + parent.corridors.flatMap { [$0.from, $0.to] }
             guard !allCoords.isEmpty else { return }
 
             var minLat = allCoords[0].latitude
@@ -231,7 +264,60 @@ private struct TrafficInsightsMapView: UIViewRepresentable {
                 span: MKCoordinateSpan(latitudeDelta: max((maxLat - minLat) * 1.5, 0.02),
                                        longitudeDelta: max((maxLon - minLon) * 1.5, 0.02))
             )
-            mapView.setRegion(region, animated: false)
+            mapView.setRegion(region, animated: animated)
+        }
+
+        private func makeVisibleDataSignature() -> String {
+            let segmentSignature = parent.segments
+                .map { segment in
+                    let first = segment.coordinates.first
+                    let last = segment.coordinates.last
+                    return [
+                        segment.id.uuidString,
+                        "\(quantized(segment.durationSeconds, factor: 10))",
+                        "\(segment.eventCount)",
+                        "\(quantized(first?.latitude ?? 0, factor: 1_000))",
+                        "\(quantized(first?.longitude ?? 0, factor: 1_000))",
+                        "\(quantized(last?.latitude ?? 0, factor: 1_000))",
+                        "\(quantized(last?.longitude ?? 0, factor: 1_000))"
+                    ].joined(separator: ":")
+                }
+                .sorted()
+                .joined(separator: "|")
+
+            let hotspotSignature = parent.hotspots
+                .map { hotspot in
+                    [
+                        hotspot.id,
+                        "\(quantized(hotspot.coordinate.latitude, factor: 1_000))",
+                        "\(quantized(hotspot.coordinate.longitude, factor: 1_000))",
+                        "\(quantized(hotspot.totalDurationSeconds, factor: 10))",
+                        "\(hotspot.eventCount)"
+                    ].joined(separator: ":")
+                }
+                .sorted()
+                .joined(separator: "|")
+
+            let corridorSignature = parent.corridors
+                .map { corridor in
+                    [
+                        corridor.id,
+                        "\(quantized(corridor.from.latitude, factor: 1_000))",
+                        "\(quantized(corridor.from.longitude, factor: 1_000))",
+                        "\(quantized(corridor.to.latitude, factor: 1_000))",
+                        "\(quantized(corridor.to.longitude, factor: 1_000))",
+                        "\(quantized(corridor.totalDurationSeconds, factor: 10))",
+                        "\(corridor.eventCount)"
+                    ].joined(separator: ":")
+                }
+                .sorted()
+                .joined(separator: "|")
+
+            return [segmentSignature, hotspotSignature, corridorSignature].joined(separator: "||")
+        }
+
+        private func quantized(_ value: Double, factor: Double) -> Int {
+            Int((value * factor).rounded())
         }
 
         @objc func handleMapTap(_ recognizer: UITapGestureRecognizer) {
@@ -253,6 +339,13 @@ private struct TrafficInsightsMapView: UIViewRepresentable {
                     parent.selectedInsight = selection
                     return
                 }
+            }
+        }
+
+
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            if mapView.gestureRecognizers?.contains(where: { $0.state == .began || $0.state == .changed }) == true {
+                hasUserAdjustedCamera = true
             }
         }
 
