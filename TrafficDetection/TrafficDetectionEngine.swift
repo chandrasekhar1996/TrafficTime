@@ -14,6 +14,7 @@ struct TrafficSample {
     let speedMetersPerSecond: Double
     let horizontalAccuracyMeters: Double
     let roadType: RoadType
+    let roadClassConfidence: Double
     let isAutomotiveMotion: Bool
 }
 
@@ -102,7 +103,8 @@ final class TrafficDetectionEngine: ObservableObject {
     }
 
     private func shouldProcess(sample: TrafficSample, configuration: TrafficDetectionConfiguration) -> Bool {
-        guard sample.roadType == .highway || sample.roadType == .freeway else {
+        let hasMajorRoadClass = sample.roadType == .highway || sample.roadType == .freeway
+        guard hasMajorRoadClass, sample.roadClassConfidence >= configuration.minRoadClassConfidence else {
             return false
         }
 
