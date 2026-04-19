@@ -31,6 +31,7 @@ struct TrafficDetectionConfiguration: Codable, Equatable {
     var startDurationSeconds: TimeInterval = 25
     var endDurationSeconds: TimeInterval = 12
     var minGpsAccuracyMeters: Double?
+    var minRoadClassConfidence: Double = 0.5
 
     var speedThresholdMetersPerSecond: Double {
         speedUnit.toMetersPerSecond(fromDisplaySpeed: speedThreshold)
