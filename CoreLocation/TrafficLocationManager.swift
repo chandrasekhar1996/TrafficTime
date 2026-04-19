@@ -3,6 +3,7 @@ import CoreMotion
 import Foundation
 
 enum RoadType: String {
+    case freeway = "Freeway"
     case highway = "Highway"
     case arterial = "Arterial"
     case local = "Local"
@@ -16,6 +17,8 @@ final class TrafficLocationManager: NSObject, ObservableObject {
     @Published private(set) var latestCoordinate: CLLocationCoordinate2D?
     @Published private(set) var currentSpeed: CLLocationSpeed = 0
     @Published private(set) var roadType: RoadType = .unknown
+    @Published private(set) var isAutomotiveMotion: Bool = false
+    @Published private(set) var latestSample: TrafficSample?
 
     override init() {
         super.init()
@@ -23,6 +26,7 @@ final class TrafficLocationManager: NSObject, ObservableObject {
         locationManager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         locationManager.activityType = .automotiveNavigation
         requestPermissions()
+        startMotionUpdatesIfAvailable()
     }
 
     private func requestPermissions() {
@@ -31,9 +35,20 @@ final class TrafficLocationManager: NSObject, ObservableObject {
         locationManager.startUpdatingLocation()
     }
 
+    private func startMotionUpdatesIfAvailable() {
+        guard CMMotionActivityManager.isActivityAvailable() else { return }
+
+        motionActivityManager.startActivityUpdates(to: .main) { [weak self] activity in
+            guard let self, let activity else { return }
+            self.isAutomotiveMotion = activity.automotive && !activity.stationary
+        }
+    }
+
     private func updateRoadType(speed: CLLocationSpeed) {
         switch speed {
-        case 25...:
+        case 33...:
+            roadType = .freeway
+        case 25..<33:
             roadType = .highway
         case 12..<25:
             roadType = .arterial
@@ -51,5 +66,14 @@ extension TrafficLocationManager: CLLocationManagerDelegate {
         latestCoordinate = location.coordinate
         currentSpeed = max(location.speed, 0)
         updateRoadType(speed: currentSpeed)
+
+        latestSample = TrafficSample(
+            timestamp: location.timestamp,
+            coordinate: location.coordinate,
+            speedMetersPerSecond: currentSpeed,
+            horizontalAccuracyMeters: location.horizontalAccuracy,
+            roadType: roadType,
+            isAutomotiveMotion: isAutomotiveMotion
+        )
     }
 }

@@ -5,15 +5,24 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("Detection Thresholds") {
-                Stepper(value: $settings.slowThreshold, in: 1...20, step: 0.5) {
-                    Text("Slow: \(settings.slowThreshold, specifier: "%.1f") m/s")
+            Section("Traffic Event Detection") {
+                Stepper(value: $settings.speedThresholdMph, in: 10...85, step: 1) {
+                    Text("Speed threshold: \(settings.speedThresholdMph, specifier: "%.0f") mph")
                 }
-                Stepper(value: $settings.congestedThreshold, in: 0.5...10, step: 0.5) {
-                    Text("Congested: \(settings.congestedThreshold, specifier: "%.1f") m/s")
+                Stepper(value: $settings.startDurationSeconds, in: 5...120, step: 1) {
+                    Text("Start duration: \(settings.startDurationSeconds, specifier: "%.0f") s")
                 }
-                Stepper(value: $settings.stoppedThreshold, in: 0.1...3, step: 0.1) {
-                    Text("Stopped: \(settings.stoppedThreshold, specifier: "%.1f") m/s")
+                Stepper(value: $settings.endDurationSeconds, in: 5...60, step: 1) {
+                    Text("End duration: \(settings.endDurationSeconds, specifier: "%.0f") s")
+                }
+            }
+
+            Section("GPS Quality") {
+                Toggle("Filter low-accuracy GPS points", isOn: $settings.useGpsAccuracyFilter)
+                if settings.useGpsAccuracyFilter {
+                    Stepper(value: $settings.minGpsAccuracyMeters, in: 5...100, step: 1) {
+                        Text("Max horizontal accuracy: \(settings.minGpsAccuracyMeters, specifier: "%.0f") m")
+                    }
                 }
             }
 

@@ -6,6 +6,7 @@ struct TrafficTimeApp: App {
     @StateObject private var detector = TrafficDetectionEngine()
     @StateObject private var repository = TrafficRepository()
     @StateObject private var settings = TrafficSettingsStore()
+    @StateObject private var coordinator = TrafficMonitoringCoordinator()
 
     var body: some Scene {
         WindowGroup {
@@ -14,6 +15,14 @@ struct TrafficTimeApp: App {
                 .environmentObject(detector)
                 .environmentObject(repository)
                 .environmentObject(settings)
+                .onAppear {
+                    coordinator.bind(
+                        locationManager: locationManager,
+                        detector: detector,
+                        repository: repository,
+                        settings: settings
+                    )
+                }
         }
     }
 }
