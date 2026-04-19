@@ -155,7 +155,7 @@ enum TrafficSpatialAggregation {
                 let key = GridCellKey(latitude: point.latitude, longitude: point.longitude, cellSizeDegrees: cellSizeDegrees)
                 var current = cells[key] ?? CellAccumulator()
                 current.totalDurationSeconds += durationShare
-                current.eventCount += 1
+                current.eventIDs.insert(event.id)
                 current.totalWeightedSpeed += event.summary.averageSpeedMph * durationShare
                 cells[key] = current
             }
@@ -167,7 +167,7 @@ enum TrafficSpatialAggregation {
                 id: "\(key.latitudeIndex)-\(key.longitudeIndex)",
                 coordinate: key.centerCoordinate,
                 totalDurationSeconds: value.totalDurationSeconds,
-                eventCount: value.eventCount,
+                eventCount: value.eventIDs.count,
                 averageSpeedMph: speed
             )
         }
@@ -307,7 +307,7 @@ private struct CorridorKey: Hashable {
 
 private struct CellAccumulator {
     var totalDurationSeconds: TimeInterval = 0
-    var eventCount = 0
+    var eventIDs: Set<UUID> = []
     var totalWeightedSpeed: Double = 0
 }
 
